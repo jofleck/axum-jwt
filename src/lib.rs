@@ -156,7 +156,9 @@ pub struct Claims {
     pub sub: String,
     pub exp: usize,
     pub scope: String,
-    pub given_name: String,
+    pub given_name: Option<String>,
+    pub family_name: Option<String>,
+    pub email: Option<String>,
 }
 
 #[derive(Debug)]
