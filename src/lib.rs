@@ -156,7 +156,8 @@ pub struct Claims {
     pub sub: String,
     pub exp: usize,
     pub scope: String,
-    pub realm_access: Option<RealmAccess>,
+    #[serde(default)]
+    pub realm_access: RealmAccess,
     pub given_name: Option<String>,
     pub family_name: Option<String>,
     pub email: Option<String>,
@@ -165,6 +166,12 @@ pub struct Claims {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RealmAccess {
     pub roles: Vec<String>,
+}
+
+impl Default for RealmAccess {
+    fn default() -> Self {
+        RealmAccess { roles: vec![] }
+    }
 }
 
 #[derive(Debug)]
