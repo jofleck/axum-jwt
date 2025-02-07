@@ -1,16 +1,24 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use axum::{async_trait, extract::{TypedHeader}, headers::{authorization::Bearer, Authorization}, http::{request::Parts, StatusCode}, response::{IntoResponse, Response}, Json, RequestPartsExt};
+use axum::{Json, RequestPartsExt};
 use axum::extract::{FromRef, FromRequestParts};
-
-use jsonwebkey::{JsonWebKey};
-use jsonwebtoken::{Algorithm, decode, decode_header, DecodingKey, Validation};
+use axum::http::request::Parts;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum_extra::headers::Authorization;
+use axum_extra::headers::authorization::Bearer;
+use axum_extra::typed_header::TypedHeaderRejection;
+use axum_extra::TypedHeader;
+use jsonwebtoken::{decode, decode_header, Validation};
+use jwt::DecodingKey;
+use jwt::jwk::{AlgorithmParameters, JwkSet};
 use serde::{Deserialize, Serialize};
 use reqwest;
 use serde_json::json;
 use tokio::sync::RwLock;
 use thiserror::Error;
+use tracing::{error, info, instrument, trace, warn};
 
 extern crate jsonwebtoken as jwt;
 extern crate jsonwebkey as jwk;
@@ -21,16 +29,10 @@ struct OIDCDiscoveryDocument {
     pub jwks_uri: String,
 }
 
-pub struct KeyContainer {
-    decoding_key: DecodingKey,
-    validation: Validation,
-}
-
 
 pub struct JwksRepository {
     issuer_uri: String,
-    keys_fetched: bool,
-    decoding_keys: HashMap<String, KeyContainer>,
+    keys: HashMap<String, DecodingKey>,
 }
 
 #[derive(Debug)]
@@ -53,49 +55,40 @@ pub struct OIDCJwksRepresentation {
 
 impl JwksRepository {
     pub fn new(issuer: &str) -> Self {
-        Self { issuer_uri: issuer.to_string(), keys_fetched: false, decoding_keys: HashMap::new() }
+        Self { issuer_uri: issuer.to_string(), keys: HashMap::new() }
     }
-    pub fn get_key(&self, kid: String) -> Option<&KeyContainer> {
-        self.decoding_keys.get(kid.as_str())
+    pub fn get_key(&self, kid: String) -> Option<DecodingKey> {
+        self.keys.get(&kid).map(|key| key.clone())
+
     }
 
+    #[instrument (name = "fetching oauth keys", skip(self))]
     pub async fn fetch_keys(&mut self) -> Result<(), OIDCError> {
-        if self.keys_fetched {
+        if !self.keys.is_empty() {
+            trace!("Keys already fetched");
             return Ok(());
         }
         let well_known_uri = self.issuer_uri.as_str().to_owned() + "/.well-known/openid-configuration";
         let discovery_document: OIDCDiscoveryDocument = reqwest::get(well_known_uri).await?.json().await?;
-        let oidc_jkws_response: OIDCJwksResponse = reqwest::get(discovery_document.jwks_uri).await?.json().await?;
+        let jwk_set : JwkSet = reqwest::get(discovery_document.jwks_uri).await?.json().await?;
+        jwk_set.keys.iter().for_each(|key| {
+            let decoding_key = match &key.algorithm {
+                AlgorithmParameters::RSA(rsa) => Some(DecodingKey::from_rsa_components(&rsa.n, &rsa.e)),
+                _ => None,
+            };
+            match decoding_key {
+                Some(Ok(decoding_key)) => {
+                    let key = key.clone();
+                    self.keys.insert(key.common.key_id.clone().unwrap_or("".to_string()), decoding_key);
+                },
+                _ => (),
 
-        self.decoding_keys.clear();
-        oidc_jkws_response.keys.iter()
-            .filter(|key| key.alg == "RS256" && key.r#use == "sig")
-            .map(|key| -> Result<JsonWebKey, jwk::Error> { serde_json::to_string(key)?.parse() })
-            .filter(|result| {
-                if result.is_ok() {
-                    true
-                } else {
-                    eprintln!("Could not parse key. Error: {:?}", result.as_ref().err().unwrap());
-                    false
-                }
             }
-            )
-            .map(|result| result.unwrap())
-            .for_each(|key| {
-                self.decoding_keys.insert(key.key_id.unwrap(),
-                                          KeyContainer {
-                                              decoding_key: key.key.to_decoding_key(),
-                                              validation: Validation::new(Algorithm::from(key.algorithm.unwrap())),
-                                          });
-            });
-        println!("Fetched keys {:?}", self.decoding_keys.keys());
-        self.keys_fetched = true;
+        });
         Ok(())
     }
 }
 
-
-#[async_trait]
 impl<S> FromRequestParts<S> for Claims
     where
     // keep `S` generic but require that it can produce a `OIDCState`
@@ -104,22 +97,50 @@ impl<S> FromRequestParts<S> for Claims
         S: Send + Sync,
 {
     type Rejection = AuthError;
+    #[instrument (name = "extracting claims", skip(parts, state))]
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let state = Arc::from_ref(state);
         match state.jwks_repository.write().await.fetch_keys().await {
-            Err(e) => eprintln!("{}", e.msg),
+            Err(e) => error!("{}", e.msg),
             Ok(_) => ()
         }
-        let TypedHeader(Authorization(bearer)) = parts
+        let TypedHeader(Authorization(bearer)) = match parts
             .extract::<TypedHeader<Authorization<Bearer>>>()
-            .await
-            .map_err(|_| AuthError::InvalidToken)?;
+            .await {
+            Ok(header) => header,
+            Err(e) => {
+                warn!("Missing Authorization header: {}", e);
+                return Err(AuthError::MissingCredentials)
+            }
+        };
         let repo = state.jwks_repository.read().await;
-        let _header = decode_header(bearer.token())?.kid.ok_or(AuthError::PublicKeyError)?;
-        //println!("Decoded header {}", header);
-        let key_container = repo.get_key(decode_header(bearer.token())?.kid.ok_or(AuthError::PublicKeyError)?).ok_or(AuthError::PublicKeyError)?;
-        let token_data = decode::<Claims>(bearer.token(), &key_container.decoding_key, &key_container.validation)
-            .map_err(|_| AuthError::InvalidToken)?;
+        let header = match  decode_header(bearer.token()) {
+            Ok(header) => header,
+            Err(e) => {
+                warn!("Error decoding header: {}", e);
+                return Err(AuthError::InvalidToken)
+            }
+        };
+        let mut validation = Validation::new(header.alg);
+        validation.validate_aud = false; //In our case we don't need to validate the audience
+
+        let kid = header.kid.ok_or(AuthError::PublicKeyError)?;
+        let key = match repo.get_key(kid.clone()) {
+            Some(key) => key,
+            None =>
+                {
+                    warn!("Could not find key with kid: {}", kid);
+                    return Err(AuthError::PublicKeyError)
+                }
+        };
+
+        let token_data = match decode::<Claims>(bearer.token(), &key, &validation) {
+            Ok(token_data) => {token_data}
+            Err(error) => {
+                warn!("Error validating token: {}", error);
+                return Err(AuthError::InvalidToken)
+            }
+        };
         //println!("Decoding finished");
         Ok(token_data.claims)
     }

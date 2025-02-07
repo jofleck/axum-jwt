@@ -3,17 +3,16 @@ name = "axum-jwt"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-axum = { version = "0.6", features = ["headers"] }
-axum-macros = "0.2.3"
-jsonwebtoken = "8.1.1"
+axum = { version = "0.8.1" }
+axum-extra = { version = "0.10.0", features = ["typed-header"] }
+jsonwebtoken = "9.3.0"
 jsonwebkey = {version =  "0.3.5", features = ["jsonwebtoken", "jwt-convert", "generate"]}
-openidconnect = "2.3"
-reqwest = { version = "0.11", features = ["blocking", "json"] }
+reqwest = { version = "0.12.12", features = ["blocking", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.90"
 tokio = { version = "1.0", features = ["full"] }
-thiserror = "1.0"
+thiserror = "2.0.11"
+tracing = "0.1.41"
